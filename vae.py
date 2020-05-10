@@ -1,114 +1,85 @@
-"""Naive implementation of VAE with a full covariance Gaussian for the approx. dist
-
-[1] Kingma, D. P., & Welling, M. (2019). An Introduction to Variational Autoencoders. Foundations and Trends®
-    in Machine Learning, 12(4), 307–392. https://doi.org/10.1561/2200000056
-"""
-import math
-import tqdm
-import pylab as plt
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import torchvision
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+import pylab as plt
+
 
 def main():
-    transform = torchvision.transforms.ToTensor()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    transform = torchvision.transforms.Compose([
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Lambda(lambda x: x.flatten()),
+    ])
     train_ds = torchvision.datasets.MNIST('~/.datasets', download=True, transform=transform)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=32)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=128, num_workers=4, pin_memory=True)
 
-    vae = VariationalAutoencoder()
+    # Train
+    vae = VAE()
     optimizer = torch.optim.Adam(vae.parameters())
-
     vae.to(device)
-    fixed_noise = torch.randn(32, 392, device=device)
 
-    # Algorithm from [1]
-    for X_batch, _ in tqdm.tqdm(train_loader):
+    running_loss = 0
+    for X_batch, _ in train_loader:
         X_batch = X_batch.to(device)
 
-        mean, logvar, lvals = vae.encode(X_batch)
-        eps, z = vae.reparam(mean, logvar, lvals)
-
-        log_qz = -torch.sum(.5*(eps**2 + math.log(2 * math.pi) + logvar), -1)
-        log_pz = -torch.sum(.5*(z**2 + math.log(2*math.pi)), -1)
-
-        p = vae.decoder(z)
-        log_px = torch.sum(X_batch * torch.log(p) + (1 - X_batch) * torch.log(1 - p), dim=(1, 2, 3))
-
-        loss = -(torch.mean(log_px) + torch.mean(log_pz) - torch.mean(log_qz))
         optimizer.zero_grad()
+        recon, mean, logvar, z = vae(X_batch)
+
+        loss_reconstruction = X_batch * torch.log(recon) + (1 - X_batch) * torch.log(1 - recon)
+        loss_reconstruction = torch.mean(- torch.sum(loss_reconstruction, dim=-1))
+        loss_kl = torch.mean(-0.5 * torch.sum((1 + logvar - mean**2 - logvar.exp()), -1))
+
+        loss = loss_reconstruction + loss_kl
         loss.backward()
         optimizer.step()
+        running_loss += loss * X_batch.size(0)
 
-    with torch.no_grad():
-        img = torchvision.utils.make_grid(vae.decoder(fixed_noise))
-        plt.imshow(img.cpu().numpy().transpose((1, 2, 0)))
-        plt.show()
+    recon, _, _, _ = vae(X_batch)
+    plt.imshow(recon[0].detach().view(28, 28))
+    plt.show()
 
 
-class VariationalAutoencoder(nn.Module):
+class VAE(nn.Module):
     def __init__(self):
         super().__init__()
-        self.n_latent = 392
-
-        # Encoder Example
-        self.flatten = nn.Flatten()
-        self.l1 = nn.Linear(784, 784)
-        self.l2_mean = nn.Linear(784, self.n_latent)  # mean of q(z|x)
-        self.l2_logvar = nn.Linear(784, self.n_latent)  # logvar of q(z|x)
-
-        # Determine the number of outputs for the triangular matrix
-        self.tri_idx_row, self.tri_idx_col = torch.tril_indices(row=self.n_latent, col=self.n_latent)
-        idx = (self.tri_idx_row != self.tri_idx_col)  # Delete diagonal
-        self.tri_idx_row = self.tri_idx_row[idx]
-        self.tri_idx_col = self.tri_idx_col[idx]
-
-        self.l2_Lvals = nn.Linear(784, len(self.tri_idx_col))  # cholesky of cov
+        self.encoder = nn.Sequential(
+            nn.Linear(784, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        self.encoder_mean = nn.Linear(64, 2)
+        self.encoder_logvar = nn.Linear(64, 2)
 
         self.decoder = nn.Sequential(
-            nn.Linear(392, 784), nn.ReLU(),
-            nn.Linear(784, 784), nn.Sigmoid(), Unflatten(1, 28, 28)
+            nn.Linear(2, 64), nn.ReLU(),
+            nn.Linear(64, 128), nn.ReLU(),
+            nn.Linear(128, 256), nn.ReLU(),
+            nn.Linear(256, 512), nn.ReLU(),
+            nn.Linear(512, 784), nn.Sigmoid(),
         )
 
     def encode(self, x):
-        x = self.flatten(x)
-        x = self.l1(x)
+        x = self.encoder(x)
+        mean = self.encoder_mean(x)
+        logvar = self.encoder_logvar(x)
+        return mean, logvar
 
-        mean = self.l2_mean(x)
-        logvar = self.l2_logvar(x)
-        Lvals = self.l2_Lvals(x)
+    def reparam(self, mean, logvar):
+        eps = torch.randn(mean.shape, device=mean.device)
+        return (0.5 * logvar.exp()) * eps + mean
 
-        return mean, logvar, Lvals
+    def decode(self, z):
+        return self.decoder(z)
 
-    def reparam(self, mean, logvar, L_vals):
-        device = mean.device
-        batch_size = mean.size(0)
-
-        # Transform Lvals into a triangular matrix
-        L = torch.zeros(batch_size, self.n_latent, self.n_latent, device=device)
-        L[:, self.tri_idx_row, self.tri_idx_col] = L_vals
-        L += torch.diag_embed(torch.exp(logvar))  # Diagonal matrix for batch
-
-        # sample noise from mutlivariate Gaussian
-        eps = torch.randn((batch_size, self.n_latent), device=device)
-
-        # Use batchwise matrix multiplication
-        sample = mean + torch.bmm(L, eps.unsqueeze(-1)).squeeze()
-
-        return eps, sample
-
-class Unflatten(nn.Module):
-    def __init__(self, channel, height, width):
-        super().__init__()
-        self.channel = channel
-        self.height = height
-        self.width = width
-
-    def forward(self, input):
-        return input.view(input.size(0), self.channel, self.height, self.width)
+    def forward(self, x):
+        mean, logvar = self.encode(x)
+        z = self.reparam(mean, logvar)
+        reconstruction = self.decode(z)
+        return reconstruction, mean, logvar, z
 
 
 if __name__ == "__main__":
